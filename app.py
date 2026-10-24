@@ -1,9 +1,14 @@
+import base64
 import os
-import wave
 import tempfile
+import time
+import wave
+
 import gradio as gr
-from google import genai
-from google.genai import types
+import httpx
+from dotenv import load_dotenv
+
+load_dotenv()
 
 API_KEY = os.environ.get("GEMINI_API_KEY")
 APP_USER = os.environ.get("APP_USER")
@@ -14,7 +19,10 @@ if not API_KEY:
 if not APP_USER or not APP_PASS:
     raise RuntimeError("APP_USER and APP_PASS environment variables must be set.")
 
-client = genai.Client(api_key=API_KEY)
+TEXT_MODEL = "gemini-3.5-flash"
+TEXT_FALLBACK_MODEL = "gemini-3.1-flash-lite"
+TTS_MODEL = "gemini-3.8-flash-lite-tts"
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
 SYSTEM_PROMPT = """
 You are a warm, real human phone receptionist for 'Solnce' (pronounced Sol-anse), a rooftop solar company in Gujarat.
@@ -32,59 +40,114 @@ CRITICAL VOICE & PRONUNCIATION RULES:
 """
 
 
-def save_pcm_to_wav(pcm_bytes, rate=24000):
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-    with wave.open(tmp.name, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(rate)
-        wf.writeframes(pcm_bytes)
-    return tmp.name
+def api_request(model, payload, timeout=35.0):
+    url = GEMINI_URL.format(model=model)
+    with httpx.Client(timeout=timeout) as client:
+        response = client.post(
+            url,
+            headers={"x-goog-api-key": API_KEY, "Content-Type": "application/json"},
+            json=payload,
+        )
+        response.raise_for_status()
+        return response.json()
 
 
-def process_voice(audio_filepath, chat_ui, user_history):
+def extract_text(data):
+    for candidate in data.get("candidates", []):
+        for part in candidate.get("content", {}).get("parts", []):
+            if "text" in part:
+                return part["text"].strip()
+    return ""
+
+
+def extract_audio(data):
+    for candidate in data.get("candidates", []):
+        for part in candidate.get("content", {}).get("parts", []):
+            inline = part.get("inlineData") or part.get("inline_data")
+            if inline and inline.get("data"):
+                return base64.b64decode(inline["data"]), inline.get("mimeType") or inline.get("mime_type")
+    return None, None
+
+
+def save_wav(audio_bytes, mime_type=None):
+    if audio_bytes.startswith(b"RIFF") and audio_bytes.find(b"WAVE") != -1:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+            tmp.write(audio_bytes)
+            return tmp.name
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+        with wave.open(tmp.name, "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(24000)
+            wav_file.writeframes(audio_bytes)
+        return tmp.name
+
+
+def process_voice(audio_filepath, chat_ui, history):
     if not audio_filepath:
-        return None, chat_ui, user_history
+        return None, chat_ui or [], history or []
 
-    with open(audio_filepath, "rb") as f:
-        wav_bytes = f.read()
+    with open(audio_filepath, "rb") as audio_file:
+        wav_bytes = audio_file.read()
 
-    user_history.append(
-        types.Content(role="user", parts=[types.Part.from_bytes(data=wav_bytes, mime_type="audio/wav")])
-    )
+    current_history = history or []
+    current_history.append({
+        "role": "user",
+        "parts": [{"inlineData": {"mimeType": "audio/wav", "data": base64.b64encode(wav_bytes).decode("ascii")}}],
+    })
 
-    text_resp = client.models.generate_content(
-        model="gemini-3.8-flash",
-        contents=user_history,
-        config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT, temperature=0.5),
-    )
-    reply_text = text_resp.text.strip()
+    text_payload = {
+        "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "contents": current_history[-8:],
+        "generationConfig": {
+            "temperature": 0.5,
+            "maxOutputTokens": 300,
+        },
+    }
 
-    user_history.append(
-        types.Content(role="model", parts=[types.Part.from_text(text=reply_text)])
-    )
+    try:
+        started = time.monotonic()
+        try:
+            reply_text = extract_text(api_request(TEXT_MODEL, text_payload, timeout=15.0))
+        except httpx.HTTPError as exc:
+            print(f"Text model {TEXT_MODEL} failed: {exc}")
+            reply_text = extract_text(api_request(TEXT_FALLBACK_MODEL, text_payload, timeout=25.0))
+        print(f"Text reply completed in {time.monotonic() - started:.2f}s")
+        if not reply_text:
+            raise ValueError("Gemini returned no text reply.")
 
-    audio_resp = client.models.generate_content(
-        model="gemini-2.5-flash-preview-tts",
-        contents=f"Speak this naturally and warmly like a friendly Indian customer care executive on a phone call: {reply_text}",
-        config=types.GenerateContentConfig(
-            response_modalities=["AUDIO"],
-            speech_config=types.SpeechConfig(
-                voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Aoede")
-                )
-            ),
-        ),
-    )
+        current_history.append({"role": "model", "parts": [{"text": reply_text}]})
+        current_history = current_history[-8:]
 
-    pcm_data = audio_resp.candidates[0].content.parts[0].inline_data.data
-    out_wav_path = save_pcm_to_wav(pcm_data)
+        tts_payload = {
+            "contents": [{"role": "user", "parts": [{
+                "text": reply_text,
+                "speech_metadata": {
+                    "style": "Speak naturally and warmly like a friendly Indian customer care executive. Use a clear, conversational phone-call tone."
+                },
+            }]}],
+            "generationConfig": {
+                "responseModalities": ["AUDIO"],
+                "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": "Aoede"}}},
+            },
+        }
+        tts_data = api_request(TTS_MODEL, tts_payload)
+        audio_bytes, mime_type = extract_audio(tts_data)
+        if not audio_bytes:
+            raise ValueError("Gemini returned no audio reply.")
 
-    chat_ui = chat_ui or []
-    chat_ui.append({"role": "user", "content": "🎤 [Voice Message]"})
-    chat_ui.append({"role": "assistant", "content": reply_text})
+        transcript = chat_ui or []
+        transcript.append({"role": "user", "content": "[Voice message]"})
+        transcript.append({"role": "assistant", "content": reply_text})
+        return save_wav(audio_bytes, mime_type), transcript, current_history
 
-    return out_wav_path, chat_ui, user_history
+    except (httpx.HTTPError, ValueError, KeyError) as exc:
+        print(f"Solnce voice processing error: {exc}")
+        transcript = chat_ui or []
+        transcript.append({"role": "user", "content": "[Voice message]"})
+        transcript.append({"role": "assistant", "content": "Sorry, I could not process that call. Please try again."})
+        return None, transcript, current_history
 
 
 def clear_call():
