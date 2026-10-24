@@ -54,7 +54,7 @@ def process_voice(audio_filepath, chat_ui, user_history):
     )
 
     text_resp = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-3.8-flash",
         contents=user_history,
         config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT, temperature=0.5),
     )
